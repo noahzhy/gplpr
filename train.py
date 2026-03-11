@@ -1,4 +1,5 @@
 # from memory_profiler import profile
+import copy
 import yaml
 import torch
 import torch.nn as nn
@@ -39,11 +40,127 @@ torch.cuda.set_per_process_memory_fraction(1.0, 0)
 # memory for other operations. It's particularly useful when working with limited GPU memory.
 torch.cuda.empty_cache()
 
+DEFAULT_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+
+def _get_alphabet(config):
+    alphabet = config.get('alphabet')
+    if alphabet is not None:
+        return alphabet
+
+    model_args = config.get('model', {}).get('args', {})
+    alphabet = model_args.get('alphabet')
+    if alphabet is not None:
+        return alphabet
+
+    return DEFAULT_ALPHABET
+
+
+def _build_stage_spec(stage_config, alphabet, default_k, batch_size, with_lr=False):
+    wrapper_args = {
+        'alphabet': alphabet,
+        'maxT': stage_config.get('maxT', default_k),
+        'img_size': stage_config.get('img_size', [32, 96]),
+        'data_aug': stage_config.get('data_aug', False),
+        'image_dir': stage_config.get('image_dir'),
+        'language': stage_config.get('language'),
+        'with_lr': with_lr,
+    }
+
+    stage_spec = {
+        'wrapper': {
+            'name': 'Ocr_images_lp',
+            'args': wrapper_args,
+        },
+        'batch': batch_size,
+    }
+
+    if stage_config.get('path_split') is not None:
+        stage_spec['dataset'] = {
+            'name': 'ocr_img',
+            'args': {
+                'path_split': stage_config['path_split'],
+                'phase': stage_config.get('phase', 'training'),
+            },
+        }
+
+    return stage_spec
+
+
+def normalize_config(config):
+    if 'train_dataset' in config and 'val_dataset' in config:
+        return config
+
+    if 'train' not in config or 'val' not in config:
+        return config
+
+    normalized = copy.deepcopy(config)
+    alphabet = _get_alphabet(normalized)
+    time_steps = normalized.get('time_steps', normalized.get('train', {}).get('maxT', 9))
+    batch_size = normalized.get('batch_size', 128)
+    model_input_shape = normalized.get('input_shape', [32, 96, 1])
+    model_channels = 3 if len(model_input_shape) < 3 else max(3, int(model_input_shape[2]))
+
+    normalized['alphabet'] = alphabet
+    normalized.setdefault('func_train', 'GP_LPR_TRAIN')
+    normalized.setdefault('func_val', 'GP_LPR_VAL')
+    normalized.setdefault('optimizer', {
+        'name': 'adam',
+        'args': {
+            'lr': normalized.get('lr', 1.e-3),
+            'betas': [0.5, 0.555],
+        },
+    })
+    normalized.setdefault('loss', {
+        'name': 'CrossEntropyLoss',
+        'args': {
+            'size_average': None,
+            'reduce': None,
+            'reduction': 'mean',
+        },
+    })
+    normalized.setdefault('early_stopper', {
+        'patience': 400,
+        'min_delta': 0,
+        'counter': 0,
+    })
+    normalized.setdefault('epoch_max', normalized.get('epochs', 3000))
+    normalized.setdefault('epoch_save', normalized.get('eval_freq', 100))
+    normalized.setdefault('resume', None)
+    normalized.setdefault('model', {
+        'name': 'GPLPR',
+        'OCR_TRAIN': True,
+        'args': {
+            'nc': model_channels,
+            'alphabet': alphabet,
+            'k': time_steps,
+            'isSeqModel': True,
+            'head': 2,
+            'inner': 256,
+            'isl2Norm': True,
+        },
+    })
+
+    normalized['train_dataset'] = _build_stage_spec(
+        normalized['train'], alphabet, time_steps, batch_size, with_lr=normalized.get('with_lr', False)
+    )
+    normalized['val_dataset'] = _build_stage_spec(
+        normalized['val'], alphabet, time_steps, batch_size, with_lr=False
+    )
+    if 'test' in normalized and 'test_dataset' not in normalized:
+        normalized['test_dataset'] = _build_stage_spec(
+            normalized['test'], alphabet, time_steps, batch_size, with_lr=False
+        )
+
+    return normalized
+
 def make_dataloader(spec, tag=''):
-    # Create the dataset based on the provided specification
-    dataset = datasets.make(spec['dataset'])
-    # Create a dataset wrapper based on the provided specification and the previously created dataset
-    dataset = datasets.make(spec['wrapper'], args={'dataset': dataset})
+    dataset = None
+    if spec.get('dataset') is not None:
+        dataset = datasets.make(spec['dataset'])
+
+    wrapper_args = {'dataset': dataset} if dataset is not None else None
+    dataset = datasets.make(spec['wrapper'], args=wrapper_args)
     
     loader = DataLoader(
         dataset,
@@ -281,6 +398,7 @@ if __name__ == '__main__':
     # Read the configuration file (usually in YAML format)
     with open(args.config, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
+    config = normalize_config(config)
     
     # Determine the save name for checkpoints
     save_name = args.save
@@ -290,22 +408,23 @@ if __name__ == '__main__':
         save_name += '_' + args.tag
         
     # Create a save path for model checkpoints and ensure the directory exists
-    save_path = Path('./save') / Path(save_name)
+    save_path = Path("/home/haoyu/projects/gplpr/save")
     save_path.mkdir(parents=True, exist_ok=True)
     
     # Call the main training function with the configuration and save path
     main(config, save_path)
     
     # Send an email notification about training completion (optional)
-    msg = MIMEText("Your training process has completed successfully.")
-    msg['Subject'] = config['email']['subject'] + '_' + config['model']['name']
-    msg['From'] = config['email']['sender']
-    msg['To'] = config['email']['recipient']
-    
-    smtp_server = "smtp.gmail.com"
-    smtp_port = 587
-    server = smtplib.SMTP(smtp_server, smtp_port)
-    server.starttls()
-    server.login(config['email']['sender'], config['email']['passwd'])
-    server.sendmail(config['email']['sender'], config['email']['recipient'], msg.as_string())
-    server.quit()
+    if config.get('email') is not None:
+        msg = MIMEText("Your training process has completed successfully.")
+        msg['Subject'] = config['email']['subject'] + '_' + config['model']['name']
+        msg['From'] = config['email']['sender']
+        msg['To'] = config['email']['recipient']
+        
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(config['email']['sender'], config['email']['passwd'])
+        server.sendmail(config['email']['sender'], config['email']['recipient'], msg.as_string())
+        server.quit()

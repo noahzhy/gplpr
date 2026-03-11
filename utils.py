@@ -12,7 +12,21 @@ import torch
 from torch.optim import SGD, Adam
 import torch.nn.functional as F
 from torch.autograd import Variable
-# from tensorboardX import SummaryWriter
+from tensorboardX import SummaryWriter
+
+
+def normalize_alphabet(alphabet, ignore_case=False):
+    if isinstance(alphabet, str):
+        normalized = list(alphabet)
+    elif isinstance(alphabet, (list, tuple)):
+        normalized = [str(char) for char in alphabet]
+    else:
+        raise TypeError('alphabet must be a string, list, or tuple')
+
+    if ignore_case:
+        normalized = [char.lower() for char in normalized]
+
+    return normalized
 
 def make_optimizer(model_param, spec, load_optimizer=False):
     Optimizer = {

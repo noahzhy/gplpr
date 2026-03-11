@@ -15,8 +15,7 @@ class ocr_dataset(Dataset):
             path_imgs, split = path.split(';')
             path_imgs = path_imgs.strip()
             
-            sample = {"img": path_imgs,
-                      }
+            sample = {"img": path_imgs}
             
             if self.phase in split:
                 self.dataset.append(sample)

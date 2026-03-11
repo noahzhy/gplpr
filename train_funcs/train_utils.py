@@ -10,6 +10,7 @@ from torchvision import transforms
 import torch.nn.functional as F
 from matplotlib import pyplot as plt
 from sklearn.metrics import confusion_matrix
+import utils
 # import seaborn as sns
     
 class strLabelConverter(object):
@@ -25,9 +26,7 @@ class strLabelConverter(object):
 
     def __init__(self, alphabet, ignore_case=False):
         self._ignore_case = ignore_case
-        if self._ignore_case:
-            alphabet = alphabet.lower()
-        self.alphabet = '-'+alphabet  # for `-1` index
+        self.alphabet = ['-'] + utils.normalize_alphabet(alphabet, ignore_case=self._ignore_case)
 
         self.dict = {}
         for i, char in enumerate(self.alphabet):
@@ -66,7 +65,7 @@ class strLabelConverter(object):
 
         return self.dict[char]
     
-    def encode_list(self, text, K=7):
+    def encode_list(self, text, K=9):
         """Support batch or single str.
 
         Args:
@@ -173,7 +172,7 @@ def train_ocr(train_loader, model, opt, loss_fn, confusing_pairs, *args):
     train_loss = []
     
     for i_batch, batch in enumerate(pbar):
-        text = converter.encode_list(batch['text'], K=7).cuda()
+        text = converter.encode_list(batch['text'], K=9).cuda()
         _, preds,_ = model(batch['img'].cuda())
         loss = 0        
         preds = torch.chunk(preds, preds.size(0), 0)
@@ -206,7 +205,7 @@ def validation_ocr(val_loader, model, loss_fn, confusing_pairs, *args):
     val_loss = []
     total = 0
     for i_batch, batch in enumerate(pbar):
-        text = converter.encode_list(batch['text'], K=7).cuda()
+        text = converter.encode_list(batch['text'], K=9).cuda()
         _, preds,_ = model(batch['img'].cuda())
         preds_all = preds        
         

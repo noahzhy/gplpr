@@ -2,14 +2,15 @@ import math
 import torch
 import numpy as np
 import torch.nn as nn
+import torchvision
 import torchvision.ops
 import torch.nn.functional as F
 
-
+import torch.onnx
 from models import register
 from argparse import Namespace
 from torch.nn.parameter import Parameter
-
+from torchvision.ops.deform_conv import DeformConv2d
 
 
 class CNNEncoder_baseline_light3(nn.Module):
@@ -265,6 +266,7 @@ class Prediction(nn.Module):
         g_output = self.w_vrm(g_output)
         return g_output
 
+
 class DeformableConv2d(nn.Module):
     def __init__(self,
                  in_channels,
@@ -273,42 +275,40 @@ class DeformableConv2d(nn.Module):
                  stride=1,
                  padding=1):
 
-        super(DeformableConv2d, self).__init__()
+        super().__init__()
+
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
-        self.stride = stride if type(stride) == tuple else (stride, stride)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
         self.padding = padding
-        
-        # init weight and bias
-        self.weight = nn.Parameter(torch.Tensor(out_channels, in_channels, kernel_size, kernel_size))
+
+        self.weight = nn.Parameter(
+            torch.Tensor(out_channels, in_channels, kernel_size, kernel_size)
+        )
         self.bias = nn.Parameter(torch.Tensor(out_channels))
 
-        # offset conv
-        self.conv_offset_mask = nn.Conv2d(in_channels, 
-                                          3 * kernel_size * kernel_size,
-                                          kernel_size=kernel_size, 
-                                          stride=stride,
-                                          padding=self.padding, 
-                                          bias=True)
-        
-        # init        
+        self.conv_offset_mask = nn.Conv2d(
+            in_channels,
+            3 * kernel_size * kernel_size,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=self.padding,
+            bias=True,
+        )
+
         self.reset_parameters()
         self._init_weight()
 
-
     def reset_parameters(self):
-        n = self.in_channels * (self.kernel_size**2)
-        stdv = 1. / math.sqrt(n)
+        n = self.in_channels * (self.kernel_size ** 2)
+        stdv = 1.0 / math.sqrt(n)
         self.weight.data.uniform_(-stdv, stdv)
         self.bias.data.zero_()
 
-
     def _init_weight(self):
-        # init offset_mask conv
-        nn.init.constant_(self.conv_offset_mask.weight, 0.)
-        nn.init.constant_(self.conv_offset_mask.bias, 0.)
-
+        nn.init.constant_(self.conv_offset_mask.weight, 0.0)
+        nn.init.constant_(self.conv_offset_mask.bias, 0.0)
 
     def forward(self, x):
         out = self.conv_offset_mask(x)
@@ -316,19 +316,32 @@ class DeformableConv2d(nn.Module):
         offset = torch.cat((o1, o2), dim=1)
         mask = torch.sigmoid(mask)
 
-        x = torchvision.ops.deform_conv2d(input=x, 
-                                          offset=offset, 
-                                          weight=self.weight, 
-                                          bias=self.bias, 
-                                          padding=self.padding,
-                                          mask=mask,
-                                          stride=self.stride)
+        x = torchvision.ops.deform_conv2d(
+            input=x,
+            offset=offset,
+            weight=self.weight,
+            bias=self.bias,
+            padding=self.padding,
+            mask=mask,
+            stride=self.stride,
+        )
         return x
+
+        # # if torch.onnx.is_in_onnx_export():
+
+        #     return torch.nn.functional.conv2d(
+        #         x,
+        #         self.weight,
+        #         self.bias,
+        #         stride=self.stride,
+        #         padding=self.padding,
+        #     )
+
 
 class Deformable_Attention(nn.Module):
 
-    def __init__(self, nc, K=7, downsample=4):
-        # Attention_module(nc=128, K=7)
+    def __init__(self, nc, K=9, downsample=4):
+        # Attention_module(nc=128, K=9)
         super(Deformable_Attention, self).__init__()
         self.K = K
 
@@ -441,15 +454,10 @@ class Deformable_Attention(nn.Module):
         return atten_list, atten_out
 
 class LPR_model(nn.Module):
-
     '''
-
     add GPM between the encoder and decoder.
-
     head and inner are parameters of GPM, the head number and dim of FFN inner features
-
     '''
-
     def __init__(self, args):
         super(LPR_model, self).__init__()
         self.isSeqModel = args.isSeqModel
@@ -466,8 +474,8 @@ class LPR_model(nn.Module):
         self.isl2Norm = args.isl2Norm
 
 
-    def forward(self, input, isTsne=False, isVis=False, isSAVis=False, isCNN=False):
-        conv_out,_ = self.encoder(input)
+    def forward(self, inputs, isTsne=False, isVis=False, isSAVis=False, isCNN=False):
+        conv_out,_ = self.encoder(inputs)
         if self.isSeqModel:
             b, c, h, w = conv_out.shape
             conv_out = conv_out.permute(0, 1, 3, 2)
@@ -485,8 +493,31 @@ class LPR_model(nn.Module):
 
         return atten_list, text_preds, enc_slf_attn
 
+
 @register('GPLPR')
-def make_GPLPR(alphabet="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", nc=1, imgW=96, imgH=32,  K=7, isSeqModel=True, head=2, inner=256, isl2Norm=True):
+def make_GPLPR(
+    alphabet="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    nc=1,
+    imgW=96,
+    imgH=32,
+    K=9,
+    k=None,
+    isSeqModel=True,
+    head=2,
+    inner=256,
+    isl2Norm=True,
+    **kwargs,
+):
+    # Backward compatibility: older configs use lowercase `k`.
+    if k is not None:
+        K = k
+    # Some YAML files provide alphabet as a list of tokens.
+    if isinstance(alphabet, (list, tuple)):
+        alphabet = ''.join(alphabet)
+    if kwargs:
+        unknown_args = ', '.join(sorted(kwargs.keys()))
+        raise TypeError(f"make_GPLPR() got unexpected keyword argument(s): {unknown_args}")
+
     args = Namespace()
     args.nclass = len(alphabet) + 1
     args.nc = nc
@@ -497,15 +528,38 @@ def make_GPLPR(alphabet="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", nc=1, imgW=96, i
     args.head = head
     args.inner = inner
     args.isl2Norm = isl2Norm
-    
     return LPR_model(args)
-    
+
+
 if __name__ == '__main__':
-    input_data2 = torch.randn((64, 3, 32, 96))
-    def_conv = DeformableConv2d(3, 3)
-    def_conv(input_data2)
-    
-    model = make_GPLPR(3, 7)
+    input_data2 = torch.randn((1, 1, 32, 96))
+    model = make_GPLPR(nc=1, K=9)
     atten_list, text_preds, enc_slf_attn = model(input_data2)
     print(model)
     print(f"{text_preds.shape}")
+
+    model.eval()
+    dummy_input = torch.randn(1, 1, 32, 96, requires_grad=True)
+
+    # export ONNX file
+    torch.onnx.export(
+        model,
+        dummy_input,
+        "gplpr.onnx",
+        verbose=True,
+        input_names=['input'],
+        output_names=['atten_list', 'text_preds', 'enc_slf_attn'],
+        export_params=True,
+        do_constant_folding=True,
+        opset_version=18
+    )
+
+    import onnx
+    onnx.checker.check_model("gplpr.onnx", full_check=True)
+
+    # count parameters and FLOPs
+    from thop import profile
+    macs, params = profile(model, inputs=(dummy_input,))
+    flops = 2 * macs
+    # print as Params (K) | FLOPs (M)
+    print('Params: %.2fK | FLOPs: %.2fM' % (params / 1e3, flops / 1e6))

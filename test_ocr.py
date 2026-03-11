@@ -6,6 +6,7 @@ import torch
 import models
 import datasets
 import argparse
+import utils
 import numpy as np
 import torch.nn as nn
 # import tensorflow as tf
@@ -37,9 +38,7 @@ class strLabelConverter(object):
 
     def __init__(self, alphabet, ignore_case=False):
         self._ignore_case = ignore_case
-        if self._ignore_case:
-            alphabet = alphabet.lower()
-        self.alphabet = '-'+alphabet  # for `-1` index
+        self.alphabet = ['-'] + utils.normalize_alphabet(alphabet, ignore_case=self._ignore_case)
 
         self.dict = {}
         for i, char in enumerate(self.alphabet):

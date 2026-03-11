@@ -7,7 +7,7 @@ from matplotlib import pyplot as plt
 
 import numpy as np
 
-def generate_dataset(root, dest, file, dlk=(9, 9), loc=7, ):
+def generate_dataset(root, dest, file, dlk=(9, 9), loc=9, ):
     root = Path(root)
     dest = Path(dest)
     destHR = dest / Path('HR')

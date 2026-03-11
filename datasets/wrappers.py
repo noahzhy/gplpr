@@ -1,6 +1,7 @@
 import numpy as np
 from matplotlib import pyplot as plt
 import re
+import os
 import cv2
 import torch
 import models
@@ -19,36 +20,66 @@ from torchvision import transforms
 from torch.utils.data import Dataset
 from skimage.feature import local_binary_pattern
 
+import utils
+
+
 def resize_fn(img, size):
     return transforms.ToTensor()(
         transforms.Resize(size, transforms.InterpolationMode.BICUBIC)(transforms.ToPILImage()(img))
     )
 
+
 @register('Ocr_images_lp')
 class Ocr_images_lp(Dataset):
     def __init__(
             self,
-            alphabet,
-            k,
-            imgW,
-            imgH,
-            aug,
-            image_aspect_ratio,
-            background,
+            alphabet=None,
+            k=None,
+            imgW=None,
+            imgH=None,
+            aug=None,
+            image_aspect_ratio=None,
+            background=(127, 127, 127),
             with_lr = False,
             test = False,
+            image_dir=None,
+            maxT=None,
+            img_size=None,
+            data_aug=None,
+            language=None,
             dataset=None,
             ):
-        
+        if img_size is not None:
+            imgH, imgW = img_size
+
+        if maxT is not None and k is None:
+            k = maxT
+
+        if data_aug is not None and aug is None:
+            aug = data_aug
+
+        if alphabet is None:
+            alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+        if image_aspect_ratio is None:
+            if imgH is None or imgW is None:
+                raise ValueError('img_size or imgH/imgW must be provided')
+            image_aspect_ratio = float(imgW) / float(imgH)
+
+        if imgW is None or imgH is None or k is None:
+            raise ValueError('k/maxT and imgW/imgH or img_size must be provided')
+
         self.imgW = imgW
         self.imgH = imgH
-        self.aug = False
+        self.aug = bool(aug)
         self.ar = image_aspect_ratio
-        self.background = eval(background)
+        self.background = eval(background) if isinstance(background, str) else tuple(background)
         self.test = test
-        self.dataset = dataset
+        self.dataset = dataset if dataset is not None else self.build_dataset_from_image_dir(image_dir)
         self.k = k
-        self.alphabet = alphabet
+        self.alphabet = utils.normalize_alphabet(alphabet)
+        self.label_to_char = self.build_label_to_char_map()
+        self.language = language
         self.with_lr = with_lr
         self.transformImg = np.array([
                 A.GaussNoise(var_limit=(10.0, 50.0), mean=0, per_channel=True, always_apply=True, p=1.0),
@@ -68,7 +99,39 @@ class Ocr_images_lp(Dataset):
                 A.ColorJitter(p=1),
                 None
             ])
-            
+
+    def build_dataset_from_image_dir(self, image_dir):
+        if image_dir is None:
+            raise ValueError('Either dataset or image_dir must be provided')
+
+        image_root = Path(image_dir)
+        image_paths = []
+        for pattern in ('*.jpg', '*.jpeg', '*.png', '*.bmp', '*.webp'):
+            image_paths.extend(image_root.rglob(pattern))
+
+        return [{'img': str(path)} for path in sorted(image_paths)]
+
+    def build_label_to_char_map(self):
+        canonical_alphabet = list('1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        if len(self.alphabet) == len(canonical_alphabet) and set(self.alphabet) == set(canonical_alphabet):
+            chars = canonical_alphabet
+        else:
+            chars = self.alphabet
+
+        return {index: char for index, char in enumerate(chars, start=1)}
+
+    def resolve_label_file(self, image_path):
+        image_path = Path(image_path)
+        label_path = Path(str(image_path).replace('images', 'labels')).with_suffix('.txt')
+        if label_path.exists():
+            return label_path
+
+        fallback_path = image_path.with_suffix('.txt')
+        if fallback_path.exists():
+            return fallback_path
+
+        raise FileNotFoundError(f'No label file found for {image_path}')
+
     def Open_image(self, img, cvt=True):
         # print(img)
         img = cv2.imread(img)
@@ -103,43 +166,42 @@ class Ocr_images_lp(Dataset):
         return img, border_w, border_h
     
     def extract_plate_numbers(self, file_path, pattern):
-        # List to store extracted plate numbers
-        plate_numbers = []
-        
-        # Open the text file
         with open(file_path, 'r') as file:
-            # Iterate over each line in the file
-            for line in file:
-                # Search for the pattern in the current line
-                matches = re.search(pattern, line)
-                # If a match is found
-                if matches:
-                    # Extract the matched string
-                    plate_number = matches.group(1)
-                    # Add the extracted plate number to the list
-                    plate_numbers.append(plate_number)
-        
-        # Return the list of extracted plate numbers
-        return plate_numbers[0]
+            lines = [line.strip() for line in file if line.strip()]
+
+        if not lines:
+            return ''
+
+        first_tokens = [line.split()[0] for line in lines]
+        if all(token.lstrip('-').isdigit() for token in first_tokens):
+            label_ids = [int(token) for token in first_tokens]
+            return ''.join(self.label_to_char[label_id] for label_id in label_ids if label_id in self.label_to_char)
+
+        for line in lines:
+            matches = re.search(pattern, line)
+            if matches:
+                return matches.group(1)
+
+        raise ValueError(f'Unable to parse plate label from {file_path}')
     
     def rectify_img(self, img, pts, margin=2):
         # obtain a consistent order of the points and unpack them individually
         # rect = order_points(pts)
         (tl, tr, br, bl) = pts
-     
+
         # compute the width of the new image, which will be the maximum distance between bottom-right and bottom-left x-coordiates or the top-right and top-left x-coordinates
         widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
         widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
         maxWidth = max(int(widthA), int(widthB))
-     
+
         # compute the height of the new image, which will be the maximum distance between the top-right and bottom-right y-coordinates or the top-left and bottom-left y-coordinates
         heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
         heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
         maxHeight = max(int(heightA), int(heightB))
 
-        maxWidth += margin*2
+        maxWidth  += margin*2
         maxHeight += margin*2
-     
+
         # now that we have the dimensions of the new image, construct the set of destination points to obtain a "birds eye view", (i.e. top-down view) of the image, again specifying points in the top-left, top-right, bottom-right, and bottom-left order
         ww = maxWidth - 1 - margin
         hh = maxHeight - 1 - margin
@@ -153,8 +215,7 @@ class Ocr_images_lp(Dataset):
         # compute the perspective transform matrix and then apply it
         M = cv2.getPerspectiveTransform(pts, dst)
         warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
-     
-        return warped 
+        return warped
     
     def padding(self, img, min_ratio, max_ratio, color = (0, 0, 0)):
         img_h, img_w = np.shape(img)[:2]
@@ -179,7 +240,6 @@ class Ocr_images_lp(Dataset):
         border_h = border_h//2
 
         img = cv2.copyMakeBorder(img, border_h, border_h, border_w, border_w, cv2.BORDER_CONSTANT, value = color)
-        
         return img, border_w, border_h
     
     def get_pts(self, file):
@@ -197,8 +257,6 @@ class Ocr_images_lp(Dataset):
             # name = item['img']
             name.append(item['img'])
             
-            
-            
             if self.with_lr:
                 img = self.Open_image(item["img"].replace('HR', 'LR') if random.random() < 0.5 else item["img"])
             else:
@@ -212,19 +270,14 @@ class Ocr_images_lp(Dataset):
                 if augment is not None:
                     img = augment(image=img)["image"]
             
-                 
-            
-            
             img, _, _ = self.padding(img, self.ar-0.15, self.ar+0.15, self.background)    
             img = resize_fn(img, (self.imgH, self.imgW))
             imgs.append(img)
-            gt = self.extract_plate_numbers(Path(item["img"]).with_suffix('.txt'), pattern=r'plate: (\w+)')
-            gts.append(gt)  
+            gt = self.extract_plate_numbers(self.resolve_label_file(item['img']), pattern=r'plate: (\w+)')
+            gts.append(gt)
         
         batch_txts = gts
-        
         batch_imgs = torch.stack(imgs)
-        
         return {
                 'img': batch_imgs, 'text': batch_txts, 'name': name
         }
