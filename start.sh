@@ -1,0 +1,1 @@
+nohup python3 -u /workspace/gplpr/train.py --config /workspace/tinyLPR/configs/config_SK136.yaml >> out.log 2>&1 &
