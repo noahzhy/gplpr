@@ -191,8 +191,9 @@ def train_ocr(train_loader, model, opt, loss_fn, confusing_pairs, *args):
 
         with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
             _, preds, _ = model(imgs)
+            preds_for_loss = preds.contiguous().clone()
             # Vectorized loss over batch/time dimensions: [B, K, C] -> [B*K, C], targets [B*K]
-            loss = loss_fn(preds.reshape(-1, preds.shape[-1]), text.reshape(-1))
+            loss = loss_fn(preds_for_loss.reshape(-1, preds_for_loss.shape[-1]), text.reshape(-1))
         
         opt.zero_grad(set_to_none=True)
         if scaler is not None and scaler.is_enabled():
@@ -232,7 +233,8 @@ def validation_ocr(val_loader, model, loss_fn, confusing_pairs, *args):
                 imgs = imgs.contiguous(memory_format=torch.channels_last)
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 _, preds, _ = model(imgs)
-                loss = loss_fn(preds.reshape(-1, preds.shape[-1]), text.reshape(-1))
+                preds_for_loss = preds.contiguous().clone()
+                loss = loss_fn(preds_for_loss.reshape(-1, preds_for_loss.shape[-1]), text.reshape(-1))
             preds_all = preds
 
             _, preds_all = preds_all.max(2)
