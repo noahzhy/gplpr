@@ -261,29 +261,33 @@ def main(config_, save_path):
     
     # Create log and writer for logging training progress
     log, writer = utils.make_log_writer(save_path)
-    
+
     # Create data loaders for training and validation datasets
     train_loader, val_loader = make_dataloaders()
-    
+
     # Initialize the model, optimizer, learning rate scheduler, and early stopper
     model, optimizer, epoch_start, lr_scheduler, early_stopper = prepare_training()
     train = train_funcs.make(config['func_train'])
     validation = train_funcs.make(config['func_val'])
     # Create the loss function for training    
     loss_fn = losses.make(config['loss'])
-    
+
     # Get the number of available GPUs
     n_gpus = torch.cuda.device_count()
     print(n_gpus)
-    
+
     # If multiple GPUs are available, use DataParallel to parallelize model training
     # if n_gpus > 1:
     #     model = nn.parallel.DataParallel(model)
-        
+
     # Get maximum number of epochs and epoch save interval from configuration
     epoch_max = config['epoch_max']
-    epoch_save = config.get('epoch_save')
-    
+    epoch_save = config.get('epoch_save', 1)  # 默认每1个epoch保存一次
+
+    # 中间保存目录，默认当前路径下 save 文件夹
+    intermediate_save_path = Path('./save')
+    intermediate_save_path.mkdir(parents=True, exist_ok=True)
+
     # Create a timer to measure training time
     timer = utils.Timer()  
     confusing_pair = []
@@ -292,56 +296,54 @@ def main(config_, save_path):
         # Initialize timer for the current epoch
         print(f"epoch {epoch}/{epoch_max}")
         t_epoch_init = timer._get()
-        
+
         # Prepare logging information for the current epoch
         log_info = ['epoch {}/{}'.format(epoch, epoch_max)]
-        
+
         # Log the learning rate and add it to the writer
         writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
         log_info.append('lr:{}'.format(optimizer.param_groups[0]['lr']))
-        
+
         # Perform training for the current epoch and get the training loss
         train_loss = train(train_loader, model, optimizer, loss_fn, confusing_pair, config) 
         log_info.append('train: loss={:.4f}'.format(train_loss))
         writer.add_scalar('train_loss', train_loss, epoch)
-        
+
         # Perform validation for the current epoch and get the validation loss
         val_loss, confusing_pair = validation(val_loader, model, loss_fn, confusing_pair, config)             
         log_info.append('val: loss={:.4f}'.format(val_loss))
         writer.add_scalar('val_train_loss', val_loss, epoch)
-        
+
         # Adjust the learning rate using the learning rate scheduler if it's defined
         if lr_scheduler is not None:
-            #print(lr_scheduler)
             lr_scheduler.step(val_loss)
-            #print('val_loss (Accuracy): ', val_loss)
-        
+
         # Calculate and log elapsed times for the current epoch
         t = timer._get()        
         t_epoch = timer.time_text(t - t_epoch_init )
         t_elapsed = timer.time_text(t)
         log_info.append('{} / {}'.format(t_epoch, t_elapsed))
-        
+
         # Check for early stopping and log the status
         stop, bm = early_stopper.early_stop(val_loss)
         log_info.append('Early stop {} / Best model {}'.format(stop, bm))
-        
+
         # Get the underlying model (without DataParallel) if multiple GPUs are used
         if n_gpus > 1:
             model_ = model.module
         else:
             model_ = model
-        
+
         # Prepare model and optimizer specifications for saving
         model_spec = config['model']
         model_spec['sd'] = model_.state_dict()
         optimizer_spec = config['optimizer']
         optimizer_spec['sd'] = optimizer.state_dict()
         early_stopper_ = vars(early_stopper)
-        
+
         # Get the current random number generator state
         state = torch.get_rng_state()
-        
+
         # Create a dictionary to save the model checkpoint
         sv_file = {
             'model': model_spec, 
@@ -350,27 +352,28 @@ def main(config_, save_path):
             'state': state, 
             'early_stopping': early_stopper_
             }
-        
+
         # Save the model checkpoint if it's the best model so far
         if bm:
             torch.save(sv_file, save_path / Path('best_model_'+'Epoch_{}'.format(epoch)+'.pth'))
         else:
             torch.save(sv_file, save_path / Path('epoch-last.pth'))
-        
-        # Save the model checkpoint if it's an epoch save interval
+
+        # Save the model checkpoint if it's an epoch save interval (主保存)
         if (epoch_save is not None) and (epoch % epoch_save == 0):
             torch.save(sv_file, save_path / Path('epoch-{}.pth'.format(epoch)))
-         
+
+        # 中间保存：每个epoch都保存到 ./save 目录下
+        torch.save(sv_file, intermediate_save_path / Path(f'intermediate_epoch_{epoch}.pth'))
 
         # Log the training progress for the current epoch
         log(', '.join(log_info))
         writer.flush()
-        
+
         # Check for early stopping and break the loop if early stopping criteria are met
         if stop:
             print('Early stop: {}'.format(stop))
             break
-
 
 
 if __name__ == '__main__':
