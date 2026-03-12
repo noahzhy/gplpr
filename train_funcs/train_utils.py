@@ -12,6 +12,13 @@ from matplotlib import pyplot as plt
 from sklearn.metrics import confusion_matrix
 import utils
 # import seaborn as sns
+
+
+def _resolve_amp_dtype(config):
+    dtype = str(config.get('amp_dtype', 'float16')).lower()
+    if dtype in ('bfloat16', 'bf16'):
+        return torch.bfloat16
+    return torch.float16
     
 class strLabelConverter(object):
     """Convert between str and label.
@@ -164,7 +171,12 @@ class strLabelConverter(object):
 @register('GP_LPR_TRAIN')
 def train_ocr(train_loader, model, opt, loss_fn, confusing_pairs, *args):
     config = args[0]
+    scaler = args[1] if len(args) > 1 else None
     converter = strLabelConverter(config['alphabet'])
+    device = next(model.parameters()).device
+    use_amp = bool(config.get('use_amp', torch.cuda.is_available())) and (device.type == 'cuda')
+    amp_dtype = _resolve_amp_dtype(config)
+    use_channels_last = bool(config.get('use_channels_last', device.type == 'cuda'))
     for p in model.parameters():
         p.requires_grad = True
     model.train()
@@ -172,20 +184,24 @@ def train_ocr(train_loader, model, opt, loss_fn, confusing_pairs, *args):
     train_loss = []
     
     for i_batch, batch in enumerate(pbar):
-        text = converter.encode_list(batch['text'], K=9).cuda()
-        _, preds,_ = model(batch['img'].cuda())
-        loss = 0        
-        preds = torch.chunk(preds, preds.size(0), 0)
-        for (i, item) in enumerate(preds):
-            item = item.squeeze()
-            gt = text[i,:]
-            loss_item = loss_fn(item, gt)
-            loss+= loss_item
-        loss = loss/(i+1)
+        text = converter.encode_list(batch['text'], K=9).to(device, non_blocking=True)
+        imgs = batch['img'].to(device, non_blocking=True)
+        if use_channels_last and imgs.dim() == 4:
+            imgs = imgs.contiguous(memory_format=torch.channels_last)
+
+        with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+            _, preds, _ = model(imgs)
+            # Vectorized loss over batch/time dimensions: [B, K, C] -> [B*K, C], targets [B*K]
+            loss = loss_fn(preds.reshape(-1, preds.shape[-1]), text.reshape(-1))
         
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        opt.zero_grad(set_to_none=True)
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            opt.step()
         
         train_loss.append(loss.detach().item())
         pbar.set_postfix({'loss': sum(train_loss)/len(train_loss)})
@@ -196,6 +212,10 @@ def train_ocr(train_loader, model, opt, loss_fn, confusing_pairs, *args):
 def validation_ocr(val_loader, model, loss_fn, confusing_pairs, *args):
     config = args[0]
     converter = strLabelConverter(config['alphabet'])
+    device = next(model.parameters()).device
+    use_amp = bool(config.get('use_amp', torch.cuda.is_available())) and (device.type == 'cuda')
+    amp_dtype = _resolve_amp_dtype(config)
+    use_channels_last = bool(config.get('use_channels_last', device.type == 'cuda'))
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -204,32 +224,29 @@ def validation_ocr(val_loader, model, loss_fn, confusing_pairs, *args):
     pbar = tqdm(val_loader, leave=False, desc='val')
     val_loss = []
     total = 0
-    for i_batch, batch in enumerate(pbar):
-        text = converter.encode_list(batch['text'], K=9).cuda()
-        _, preds,_ = model(batch['img'].cuda())
-        preds_all = preds        
-        
-        loss = 0
-        preds = torch.chunk(preds, preds.size(0), 0)    
-        
-        for (i, item) in enumerate(preds):
-            item = item.squeeze()
-            gt = text[i,:]
-            loss += loss_fn(item, gt)
-        loss = loss/(i+1)
-        
-        _, preds_all = preds_all.max(2)
-        sim_preds = converter.decode_list(preds_all.data)
-        text_label = batch['text']
-        val_loss.append(loss.detach().item())
-        
-        for pred, target in zip(sim_preds, text_label):
-            pred = pred.replace('-', '')
-            if pred == target:
-                n_correct += 1
-            total += 1
-        
-        pbar.set_postfix({'loss': sum(val_loss)/len(val_loss)})  
+    with torch.no_grad():
+        for i_batch, batch in enumerate(pbar):
+            text = converter.encode_list(batch['text'], K=9).to(device, non_blocking=True)
+            imgs = batch['img'].to(device, non_blocking=True)
+            if use_channels_last and imgs.dim() == 4:
+                imgs = imgs.contiguous(memory_format=torch.channels_last)
+            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                _, preds, _ = model(imgs)
+                loss = loss_fn(preds.reshape(-1, preds.shape[-1]), text.reshape(-1))
+            preds_all = preds
+
+            _, preds_all = preds_all.max(2)
+            sim_preds = converter.decode_list(preds_all.detach().cpu())
+            text_label = batch['text']
+            val_loss.append(loss.detach().item())
+
+            for pred, target in zip(sim_preds, text_label):
+                pred = pred.replace('-', '')
+                if pred == target:
+                    n_correct += 1
+                total += 1
+
+            pbar.set_postfix({'loss': sum(val_loss)/len(val_loss)})  
     print()
     for raw_pred, pred, gt in zip(preds_all, sim_preds, text_label):
         raw_pred = raw_pred.data

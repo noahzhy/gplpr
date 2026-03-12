@@ -1,5 +1,6 @@
 # from memory_profiler import profile
 import copy
+import time
 import yaml
 import torch
 import torch.nn as nn
@@ -26,10 +27,9 @@ import os
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-# Enable anomaly detection in PyTorch autograd. Anomaly detection helps in finding operations that
-# are not supported by autograd and can be useful for debugging. It is often used during development
-# and debugging phases.
-torch.autograd.set_detect_anomaly(True)
+# Enable anomaly detection only when explicitly requested, because it can significantly slow training.
+ENABLE_ANOMALY_DETECTION = os.environ.get('GPLPR_DETECT_ANOMALY', '0') == '1'
+torch.autograd.set_detect_anomaly(ENABLE_ANOMALY_DETECTION)
 
 # Set the per-process GPU memory fraction to 90%. This means that the GPU will allocate a maximum
 # of 90% of its available memory for this process. This can be useful to limit the GPU memory usage
@@ -41,6 +41,77 @@ torch.cuda.set_per_process_memory_fraction(1.0, 0)
 torch.cuda.empty_cache()
 
 DEFAULT_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+
+def _build_loader_kwargs(dataset, spec, tag, num_workers, pin_memory, persistent_workers, prefetch_factor):
+    loader_kwargs = {
+        'dataset': dataset,
+        'batch_size': spec['batch'],
+        'shuffle': (tag == 'train'),
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+        'collate_fn': dataset.collate_fn,
+    }
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = persistent_workers
+        loader_kwargs['prefetch_factor'] = prefetch_factor
+    return loader_kwargs
+
+
+def _auto_tune_loader(dataset, spec, tag, pin_memory):
+    # Keep startup overhead bounded while still profiling realistic loading throughput.
+    warmup_batches = int(spec.get('tune_batches', 8))
+    cpu_count = os.cpu_count() or 1
+    default_candidates = [0, 2, 4, 8, min(12, cpu_count)]
+    worker_candidates = spec.get('tune_num_workers_candidates', default_candidates)
+    worker_candidates = sorted(set(int(x) for x in worker_candidates if 0 <= int(x) <= cpu_count))
+    if not worker_candidates:
+        worker_candidates = [0]
+
+    prefetch_candidates = spec.get('tune_prefetch_candidates', [2, 4])
+    prefetch_candidates = sorted(set(max(1, int(x)) for x in prefetch_candidates))
+
+    best = None
+    for nw in worker_candidates:
+        pf_values = prefetch_candidates if nw > 0 else [None]
+        for pf in pf_values:
+            kwargs = _build_loader_kwargs(
+                dataset=dataset,
+                spec=spec,
+                tag=tag,
+                num_workers=nw,
+                pin_memory=pin_memory,
+                persistent_workers=(nw > 0),
+                prefetch_factor=2 if pf is None else pf,
+            )
+            try:
+                loader = DataLoader(**kwargs)
+                t0 = time.perf_counter()
+                seen = 0
+                for seen, _ in enumerate(loader, start=1):
+                    if seen >= warmup_batches:
+                        break
+                elapsed = max(1e-6, time.perf_counter() - t0)
+                throughput = seen / elapsed
+                del loader
+                if best is None or throughput > best['throughput']:
+                    best = {'num_workers': nw, 'prefetch_factor': pf, 'throughput': throughput}
+            except Exception:
+                continue
+
+    if best is None:
+        return None
+
+    if 'log' in globals() and callable(log):
+        log(
+            'Auto-tuned dataloader ({}): num_workers={}, prefetch_factor={}, throughput={:.2f} batch/s'.format(
+                tag,
+                best['num_workers'],
+                best['prefetch_factor'] if best['prefetch_factor'] is not None else '-',
+                best['throughput'],
+            )
+        )
+    return best
 
 
 def _get_alphabet(config):
@@ -127,6 +198,14 @@ def normalize_config(config):
     normalized.setdefault('epoch_max', normalized.get('epochs', 3000))
     normalized.setdefault('epoch_save', normalized.get('eval_freq', 100))
     normalized.setdefault('resume', None)
+    normalized.setdefault('use_amp', torch.cuda.is_available())
+    normalized.setdefault('amp_dtype', 'float16')  # float16 or bfloat16
+    normalized.setdefault('use_channels_last', torch.cuda.is_available())
+    normalized.setdefault('use_torch_compile', False)
+    normalized.setdefault('torch_compile_mode', 'reduce-overhead')
+    normalized.setdefault('torch_compile_backend', None)
+    normalized.setdefault('auto_tune_loader', True)
+    normalized.setdefault('loader_tune_batches', 8)
     normalized.setdefault('model', {
         'name': 'GPLPR',
         'OCR_TRAIN': True,
@@ -144,9 +223,13 @@ def normalize_config(config):
     normalized['train_dataset'] = _build_stage_spec(
         normalized['train'], alphabet, time_steps, batch_size, with_lr=normalized.get('with_lr', False)
     )
+    normalized['train_dataset'].setdefault('auto_tune_loader', normalized.get('auto_tune_loader', True))
+    normalized['train_dataset'].setdefault('tune_batches', normalized.get('loader_tune_batches', 8))
     normalized['val_dataset'] = _build_stage_spec(
         normalized['val'], alphabet, time_steps, batch_size, with_lr=False
     )
+    normalized['val_dataset'].setdefault('auto_tune_loader', False)
+    normalized['val_dataset'].setdefault('tune_batches', max(2, normalized.get('loader_tune_batches', 8) // 2))
     if 'test' in normalized and 'test_dataset' not in normalized:
         normalized['test_dataset'] = _build_stage_spec(
             normalized['test'], alphabet, time_steps, batch_size, with_lr=False
@@ -162,14 +245,30 @@ def make_dataloader(spec, tag=''):
     wrapper_args = {'dataset': dataset} if dataset is not None else None
     dataset = datasets.make(spec['wrapper'], args=wrapper_args)
     
-    loader = DataLoader(
-        dataset,
-        batch_size=spec['batch'],
-        shuffle=(tag == 'train'), # Shuffle the data if the tag is 'train'
-        num_workers=0, # Number of worker processes for data loading (0 means data is loaded in the main process)
-        pin_memory=False, # Whether to use pinned memory (typically used with CUDA, set to False here)
-        collate_fn=dataset.collate_fn # A function used to collate (combine) individual samples into batches
+    num_workers = int(spec.get('num_workers', min(8, os.cpu_count() or 1)))
+    pin_memory = bool(spec.get('pin_memory', torch.cuda.is_available()))
+    persistent_workers = bool(spec.get('persistent_workers', num_workers > 0))
+    prefetch_factor = int(spec.get('prefetch_factor', 2))
+
+    if spec.get('auto_tune_loader', False):
+        tuned = _auto_tune_loader(dataset, spec, tag, pin_memory)
+        if tuned is not None:
+            num_workers = tuned['num_workers']
+            if tuned['prefetch_factor'] is not None:
+                prefetch_factor = tuned['prefetch_factor']
+            persistent_workers = num_workers > 0
+
+    loader_kwargs = _build_loader_kwargs(
+        dataset=dataset,
+        spec=spec,
+        tag=tag,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
+
+    loader = DataLoader(**loader_kwargs)
 
     # """Next is only for debugging purpose"""
     # for batch in loader:
@@ -247,6 +346,21 @@ def prepare_training():
         for _ in range(epoch_start - 1):
             lr_scheduler.step()
             
+    if config.get('use_channels_last', torch.cuda.is_available()):
+        model = model.to(memory_format=torch.channels_last)
+
+    if config.get('use_torch_compile', False) and hasattr(torch, 'compile'):
+        compile_mode = config.get('torch_compile_mode', 'reduce-overhead')
+        compile_backend = config.get('torch_compile_backend')
+        try:
+            if compile_backend:
+                model = torch.compile(model, mode=compile_mode, backend=compile_backend)
+            else:
+                model = torch.compile(model, mode=compile_mode)
+            log(f'torch.compile enabled (mode={compile_mode}, backend={compile_backend})')
+        except Exception as e:
+            log(f'torch.compile disabled due to error: {e}')
+
     # Log the number of model parameters and model structure
     log('model: #params={}'.format(utils.compute_num_params(model, text=True)))
     log('model: #struct={}'.format(model))
@@ -269,6 +383,11 @@ def main(config_, save_path):
     model, optimizer, epoch_start, lr_scheduler, early_stopper = prepare_training()
     train = train_funcs.make(config['func_train'])
     validation = train_funcs.make(config['func_val'])
+
+    use_amp = bool(config.get('use_amp', torch.cuda.is_available())) and torch.cuda.is_available()
+    amp_dtype = str(config.get('amp_dtype', 'float16')).lower()
+    scaler_enabled = use_amp and amp_dtype in ('float16', 'fp16')
+    scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
     # Create the loss function for training    
     loss_fn = losses.make(config['loss'])
 
@@ -305,7 +424,7 @@ def main(config_, save_path):
         log_info.append('lr:{}'.format(optimizer.param_groups[0]['lr']))
 
         # Perform training for the current epoch and get the training loss
-        train_loss = train(train_loader, model, optimizer, loss_fn, confusing_pair, config) 
+        train_loss = train(train_loader, model, optimizer, loss_fn, confusing_pair, config, scaler) 
         log_info.append('train: loss={:.4f}'.format(train_loss))
         writer.add_scalar('train_loss', train_loss, epoch)
 
@@ -352,6 +471,8 @@ def main(config_, save_path):
             'state': state, 
             'early_stopping': early_stopper_
             }
+        if scaler.is_enabled():
+            sv_file['scaler'] = scaler.state_dict()
 
         # Save the model checkpoint if it's the best model so far
         if bm:
